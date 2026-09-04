@@ -1,5 +1,5 @@
 /* ============================================================================
- *  上网环境设置工具 v5.1  —  Win32 GUI（暗色科幻风）
+ *  上网环境设置工具 v5.2  —  Win32 GUI（暗色科幻风）
  * ----------------------------------------------------------------------------
  *  功能：
  *    1. 内网固定 IP 模式    —— netsh 设置静态 IPv4 与 DNS
@@ -41,7 +41,7 @@ static WCHAR g_DnsServer[32]  = L"211.138.24.66";
 
 /* ------------------------------ 在线更新配置 ------------------------------ */
 /* 本工具版本号（与 update.json 的 version、Release tag 保持一致的基准） */
-static const char g_version[] = "5.1.0";
+static const char g_version[] = "5.2.0";
 /* GitHub 仓库 JSON（多源容错：jsDelivr 多节点 + 国内镜像，程序内 fetch_json 按序尝试） */
 #define REL_CONFIG L"config.json"
 #define REL_UPDATE L"update.json"
@@ -74,6 +74,7 @@ static int    g_ntType = 0;           /* 0=纯公告 1=更新公告 */
 static WCHAR  g_ntTitle[128], g_ntContent[1024], g_ntUrl[512], g_ntMd5[64], g_ntFile[64];
 static int    g_ntId = 0;
 static WCHAR  g_dlPath[1024];
+static int    g_ntScroll = 0;        /* 公告内容滚动偏移（字多时可下滑） */
 
 /* ------------------------------ 颜色主题 ---------------------------------- */
 #define C_BG       RGB(10, 16, 26)     /* 主背景        #0A101A */
@@ -899,7 +900,7 @@ static void draw(HDC hdc, HWND hwnd) {
 
     /* 头部 */
     text(hdc, SC(40), SC(20), SC(420), SC(42), L"上网环境设置工具", g_fTitle, C_ACCENT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    text(hdc, SC(40), SC(64), SC(520), SC(22), L"NETWORK SWITCHER  ·  V5.1  ·  内网/互联网一键切换", g_fSub, C_DIM, DT_LEFT | DT_SINGLELINE);
+    text(hdc, SC(40), SC(64), SC(520), SC(22), L"NETWORK SWITCHER  ·  V5.2  ·  内网/互联网一键切换", g_fSub, C_DIM, DT_LEFT | DT_SINGLELINE);
     hgradient(hdc, SC(40), SC(96), W - SC(80), SC(2), C_ACCENT, C_ACCENT2);
 
     /* 参数设置按钮（右上角） */
@@ -1290,15 +1291,63 @@ static LRESULT CALLBACK n_WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
              DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         hgradient(mem, SC(28), SC(56), rc.right - SC(56), SC(2), C_ACCENT, C_ACCENT2);
         text(mem, SC(28), SC(68), rc.right - SC(56), SC(26), g_ntTitle,
-             g_fCardT, C_TEXT, DT_LEFT | DT_SINGLELINE);
-        RECT cr = { SC(28), SC(102), rc.right - SC(28), SC(268) };
-        DrawTextW(mem, g_ntContent, -1, &cr, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+             g_fChip, C_TEXT, DT_LEFT | DT_SINGLELINE);
+        /* 内容区：小字号 + 可滚动 */
+        int vtop = SC(100);
+        int vbot = g_ntType == 1 ? SC(240) : SC(268);
+        RECT view = { SC(28), vtop, rc.right - SC(28), vbot };
+        int viewH = view.bottom - view.top;
+        RECT full = view; full.bottom = 100000;
+        HFONT oldF = SelectObject(mem, g_fBody);
+        DrawTextW(mem, g_ntContent, -1, &full, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+        int contentH = full.bottom - full.top;
+        int maxScroll = contentH - viewH;
+        if (maxScroll < 0) maxScroll = 0;
+        if (g_ntScroll > maxScroll) g_ntScroll = maxScroll;
+        if (maxScroll > 0) {   /* 滚动条指示 */
+            int sbL = rc.right - SC(16), sbW = SC(4);
+            int trackH = viewH - SC(4);
+            RECT track = { sbL, view.top + SC(2), sbL + sbW, view.top + SC(2) + trackH };
+            fill(mem, track.left, track.top, track.right - track.left, track.bottom - track.top,
+                 RGB(28, 38, 58));
+            int th = SC(28);
+            if (trackH * viewH / contentH > th) th = trackH * viewH / contentH;
+            int ty = track.top + (trackH - th) * g_ntScroll / maxScroll;
+            fill(mem, sbL, ty, sbW, th, C_ACCENT);
+        }
+        int saved = SaveDC(mem);
+        IntersectClipRect(mem, view.left, view.top, view.right, view.bottom);
+        RECT dr = { view.left, view.top - g_ntScroll, view.right, view.top - g_ntScroll + contentH + SC(8) };
+        DrawTextW(mem, g_ntContent, -1, &dr, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+        RestoreDC(mem, saved);
+        SelectObject(mem, oldF);
         if (g_ntType == 1)
             text(mem, SC(28), SC(246), rc.right - SC(56), SC(18),
-                 L"点击「确定」将自动下载最新版本", g_fChip, C_DIM, DT_LEFT | DT_SINGLELINE);
+                 L"点击「确定」将自动下载最新版本，滚轮可下滑查看全文", g_fChip, C_DIM, DT_LEFT | DT_SINGLELINE);
         BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, ob); DeleteObject(bmp); DeleteDC(mem);
         EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_MOUSEWHEEL: {
+        short dz = (short)HIWORD(wp);
+        RECT rc; GetClientRect(hwnd, &rc);
+        int vtop = SC(100);
+        int vbot = g_ntType == 1 ? SC(240) : SC(268);
+        RECT view = { SC(28), vtop, rc.right - SC(28), vbot };
+        RECT full = view; full.bottom = 100000;
+        HDC dc = GetDC(hwnd);
+        HFONT oldF = SelectObject(dc, g_fBody);
+        DrawTextW(dc, g_ntContent, -1, &full, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+        int contentH = full.bottom - full.top;
+        SelectObject(dc, oldF); ReleaseDC(hwnd, dc);
+        int maxScroll = contentH - (view.bottom - view.top);
+        if (maxScroll < 0) maxScroll = 0;
+        g_ntScroll -= (dz / WHEEL_DELTA) * SC(28);
+        if (g_ntScroll < 0) g_ntScroll = 0;
+        if (g_ntScroll > maxScroll) g_ntScroll = maxScroll;
+        InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     }
 
@@ -1448,26 +1497,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         mark_current_mode();
         if (!g_admin)
             log_line(L"警告：当前未以管理员身份运行，配置可能失败", C_RED);
-        if (detect_current_mode() == 1) {
+        if (detect_current_mode() == 1)
             log_line(L"当前为互联网模式，正在检查公告与更新 ...", C_DIM);
+        else
+            log_line(L"当前为内网模式，仍尝试在线检查（无网络将提示失败）...", C_DIM);
+        /* 每次进入都检查更新：只要云端版本高于本地就弹更新公告 */
+        {
             HANDLE th = CreateThread(NULL, 0, online_check_thread, hwnd, 0, NULL);
             if (th) CloseHandle(th);
-        } else {
-            log_line(L"当前为内网模式，跳过在线检查", C_DIM);
         }
         return 0;
 
     case WM_APP_UPDATE:
-        if (g_pendingUpdate) {
+        if (g_pendingUpdate && !g_annShowing) {
             g_pendingUpdate = 0;
-            if (!g_annShowing) open_notice(hwnd, 1);
+            open_notice(hwnd, 1);
         }
         return 0;
 
     case WM_APP_NOTICE:
-        if (g_pendingNotice) {
+        if (g_pendingNotice && !g_annShowing) {
             g_pendingNotice = 0;
-            if (!g_annShowing) open_notice(hwnd, 0);
+            open_notice(hwnd, 0);
         }
         return 0;
 
@@ -1675,7 +1726,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
     int sx = GetSystemMetrics(SM_CXSCREEN), sy = GetSystemMetrics(SM_CYSCREEN);
     int wx = (sx - ww) / 2, wy = (sy - wh) / 2;
     if (wx < 0) wx = 0; if (wy < 0) wy = 0;
-    HWND hwnd = CreateWindowW(L"IPSwitchWin", L"上网环境设置工具 v5.1",
+    HWND hwnd = CreateWindowW(L"IPSwitchWin", L"上网环境设置工具 v5.2",
                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                               wx, wy, ww, wh,
                               NULL, NULL, hi, NULL);
