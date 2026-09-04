@@ -1,5 +1,5 @@
 /* ============================================================================
- *  上网环境设置工具 v5.2  —  Win32 GUI（暗色科幻风）
+ *  上网环境设置工具 v5.3  —  Win32 GUI（暗色科幻风）
  * ----------------------------------------------------------------------------
  *  功能：
  *    1. 内网固定 IP 模式    —— netsh 设置静态 IPv4 与 DNS
@@ -41,11 +41,97 @@ static WCHAR g_DnsServer[32]  = L"211.138.24.66";
 
 /* ------------------------------ 在线更新配置 ------------------------------ */
 /* 本工具版本号（与 update.json 的 version、Release tag 保持一致的基准） */
-static const char g_version[] = "5.2.0";
+static const char g_version[] = "5.3.0";
 /* GitHub 仓库 JSON（多源容错：jsDelivr 多节点 + 国内镜像，程序内 fetch_json 按序尝试） */
 #define REL_CONFIG L"config.json"
 #define REL_UPDATE L"update.json"
 #define REL_NOTICE L"notice.json"
+#define REL_TEXTS  L"texts.json"
+
+/* ============================ 云端文本（texts.json） =======================
+ * 所有用户可见的静态 UI 文本统一走 T(key)：
+ *  - 启动后若成功拉到云端 texts.json，用云端文本覆盖对应 key；
+ *  - 没网 / 拉取失败 / 未覆盖的 key，一律回退到内置默认文本。
+ * ==========================================================================*/
+typedef struct { const char *key; const WCHAR *def; WCHAR cur[256]; } TXT;
+static TXT g_txt[] = {
+    { "app_title",           L"上网环境设置工具", {0} },
+    { "sub_title",           L"NETWORK SWITCHER  ·  V5.3  ·  内网/互联网一键切换", {0} },
+    { "card_lan",            L"内网固定IP模式", {0} },
+    { "card_wan",            L"外网DHCP自动获取", {0} },
+    { "badge_applied",       L"已应用", {0} },
+    { "field_ip",            L"IP", {0} },
+    { "field_mask",          L"掩码", {0} },
+    { "field_gw",            L"网关", {0} },
+    { "field_dns",           L"DNS", {0} },
+    { "field_auto",          L"自动获取", {0} },
+    { "field_type",          L"适用", {0} },
+    { "field_internet",      L"互联网", {0} },
+    { "field_switch",        L"切换", {0} },
+    { "field_switch_desc",   L"自动获取 IP 与 DNS", {0} },
+    { "card_lan_hint",       L"点击卡片应用固定 IP 参数", {0} },
+    { "card_wan_hint",       L"点击卡片切换为 DHCP 自动获取", {0} },
+    { "btn_settings",        L"参数设置", {0} },
+    { "chip_perm",           L"权限", {0} },
+    { "chip_admin",          L"管理员", {0} },
+    { "chip_limited",        L"受限", {0} },
+    { "chip_nic",            L"网卡", {0} },
+    { "chip_ip",             L"本机IP", {0} },
+    { "btn_view",            L"查看当前网络配置", {0} },
+    { "log_title",           L"运行日志 / CONSOLE", {0} },
+    { "log_scroll",          L"滚轮翻阅", {0} },
+    { "foot_note",           L"以管理员身份运行 · 参数设置自动保存，无需外部配置文件", {0} },
+    { "settings_title",      L"网络参数设置", {0} },
+    { "lbl_interface",       L"网卡名称", {0} },
+    { "lbl_ip",              L"内网 IP", {0} },
+    { "lbl_mask",            L"子网掩码", {0} },
+    { "lbl_gw",              L"默认网关", {0} },
+    { "lbl_dns",             L"DNS 服务器", {0} },
+    { "btn_sync",            L"同步云端配置", {0} },
+    { "btn_cancel",          L"取消", {0} },
+    { "btn_save",            L"保存", {0} },
+    { "ntc_update_title",    L"发现新版本", {0} },
+    { "ntc_ann_title",       L"公告", {0} },
+    { "btn_ok",              L"确定", {0} },
+    { "btn_gotit",           L"知道了", {0} },
+    { "btn_later",           L"稍后", {0} },
+    { "ntc_dl_hint",         L"点击「确定」将自动下载最新版本，滚轮可下滑查看全文", {0} },
+    { "err_ip",              L"IP 地址格式无效", {0} },
+    { "err_mask",            L"子网掩码格式无效", {0} },
+    { "err_gw",              L"默认网关格式无效", {0} },
+    { "err_dns",             L"DNS 地址格式无效", {0} },
+    { "err_ifc",             L"网卡名称不能为空", {0} },
+    { "sync_loading",        L"正在从云端同步 ...", {0} },
+    { "sync_fail",           L"同步失败：无法连接云端或格式无效", {0} },
+    { "msg_upd_done",        L"新版本已下载完成。\n请关闭本程序后，用新文件替换旧版本即可。", {0} },
+    { "msg_upd_title",       L"下载完成", {0} },
+    { "msg_admin_req",       L"需要管理员权限运行本工具。\n请右键选择“以管理员身份运行”。", {0} },
+};
+#define TXT_N  ((int)(sizeof g_txt / sizeof g_txt[0]))
+
+/* 取 key 对应文本：云端已覆盖返回云端文本，否则返回内置默认 */
+static const WCHAR *T(const char *key) {
+    for (int i = 0; i < TXT_N; i++)
+        if (strcmp(g_txt[i].key, key) == 0)
+            return g_txt[i].cur[0] ? g_txt[i].cur : g_txt[i].def;
+    return L"?";
+}
+
+static HWND g_mainWnd = NULL;        /* 主窗口句柄（前向定义，公告区不再重复） */
+static int json_str(const char *s, const char *key, char *out, int n);
+static void unescape_newlines(char *s);
+
+/* 用云端 texts.json 内容覆盖文本表，成功则重绘主窗口 */
+static void apply_texts(const char *raw) {
+    for (int i = 0; i < TXT_N; i++) {
+        char v[256];
+        if (json_str(raw, g_txt[i].key, v, sizeof v)) {
+            unescape_newlines(v);   /* 还原 JSON 转义的 \n 为换行 */
+            MultiByteToWideChar(CP_UTF8, 0, v, -1, g_txt[i].cur, 256);
+        }
+    }
+    if (g_mainWnd) InvalidateRect(g_mainWnd, NULL, TRUE);
+}
 
 /* 公告状态（后台线程拉取后经 PostMessage 通知主线程） */
 static volatile int g_pendingUpdate = 0;
@@ -69,7 +155,6 @@ static WCHAR g_ntcTitle[128], g_ntcContent[1024];
 static int   g_ntcId = 0;
 
 /* 公告窗（当前展示内容）与下载结果 */
-static HWND   g_mainWnd = NULL;
 static int    g_ntType = 0;           /* 0=纯公告 1=更新公告 */
 static WCHAR  g_ntTitle[128], g_ntContent[1024], g_ntUrl[512], g_ntMd5[64], g_ntFile[64];
 static int    g_ntId = 0;
@@ -242,6 +327,7 @@ static char *fetch_url(const WCHAR *url, int timeout_ms) {
    注意：仅在后台线程调用，不会阻塞界面。 */
 static char *fetch_json(const WCHAR *rel, const char *need, int budget_ms) {
     static const WCHAR *bases[] = {
+        L"https://github.com/2210638944/netflip-x/raw/refs/heads/main/",
         L"https://cdn.jsdelivr.net/gh/2210638944/netflip-x@main/",
         L"https://fastly.jsdelivr.net/gh/2210638944/netflip-x@main/",
         L"https://testingcf.jsdelivr.net/gh/2210638944/netflip-x@main/",
@@ -249,7 +335,7 @@ static char *fetch_json(const WCHAR *rel, const char *need, int budget_ms) {
         L"https://cdn.jsdmirror.com/gh/2210638944/netflip-x@main/",
     };
     static const char *hosts[] = {
-        "cdn.jsdelivr.net", "fastly.jsdelivr.net", "testingcf.jsdelivr.net",
+        "github.com(直链)", "cdn.jsdelivr.net", "fastly.jsdelivr.net", "testingcf.jsdelivr.net",
         "gcore.jsdelivr.net", "cdn.jsdmirror.com",
     };
     const int n = (int)(sizeof bases / sizeof bases[0]);
@@ -806,36 +892,36 @@ static void draw_card(HDC hdc, int i) {
     fill(hdc, x + SC(12), y + SC(18), SC(3), h - SC(36), accent);
     int tx = x + SC(30), tw = w - SC(56);
     text(hdc, tx, y + SC(16), tw, SC(30),
-         i == 0 ? L"内网固定IP模式" : L"外网DHCP自动获取", g_fCardT, C_TEXT,
+         i == 0 ? T("card_lan") : T("card_wan"), g_fCardT, C_TEXT,
          DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     if (c->active) {
         int bw = SC(58), bh = SC(24);
         rounded(hdc, x + w - bw - SC(16), y + SC(18), bw, bh, SC(12), C_GREEN, CLR_NONE, 0);
-        text(hdc, x + w - bw - SC(16), y + SC(18), bw, bh, L"已应用", g_fChip, RGB(6, 40, 30),
+        text(hdc, x + w - bw - SC(16), y + SC(18), bw, bh, T("badge_applied"), g_fChip, RGB(6, 40, 30),
              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
     if (i == 0) {
-        text(hdc, tx, y + SC(50), tw, SC(20), L"IP", g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
+        text(hdc, tx, y + SC(50), tw, SC(20), T("field_ip"), g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
         text(hdc, tx + SC(120), y + SC(50), tw - SC(120), SC(20), g_StaticIP, g_fCardM, accent, DT_LEFT | DT_SINGLELINE);
-        text(hdc, tx, y + SC(74), tw, SC(20), L"掩码", g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
+        text(hdc, tx, y + SC(74), tw, SC(20), T("field_mask"), g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
         text(hdc, tx + SC(120), y + SC(74), tw - SC(120), SC(20), g_SubnetMask, g_fCardM, C_TEXT, DT_LEFT | DT_SINGLELINE);
-        text(hdc, tx, y + SC(98), tw, SC(20), L"网关", g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
+        text(hdc, tx, y + SC(98), tw, SC(20), T("field_gw"), g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
         text(hdc, tx + SC(120), y + SC(98), tw - SC(120), SC(20), g_Gateway, g_fCardM, C_TEXT, DT_LEFT | DT_SINGLELINE);
-        text(hdc, tx, y + SC(122), tw, SC(20), L"DNS", g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
+        text(hdc, tx, y + SC(122), tw, SC(20), T("field_dns"), g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
         text(hdc, tx + SC(120), y + SC(122), tw - SC(120), SC(20), g_DnsServer, g_fCardM, accent, DT_LEFT | DT_SINGLELINE);
     } else {
-        text(hdc, tx, y + SC(50), tw, SC(20), L"IP", g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
-        text(hdc, tx + SC(120), y + SC(50), tw - SC(120), SC(20), L"自动获取", g_fCardM, accent, DT_LEFT | DT_SINGLELINE);
-        text(hdc, tx, y + SC(74), tw, SC(20), L"DNS", g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
-        text(hdc, tx + SC(120), y + SC(74), tw - SC(120), SC(20), L"自动获取", g_fCardM, accent, DT_LEFT | DT_SINGLELINE);
-        text(hdc, tx, y + SC(98), tw, SC(20), L"适用", g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
-        text(hdc, tx + SC(120), y + SC(98), tw - SC(120), SC(20), L"互联网", g_fCardM, accent, DT_LEFT | DT_SINGLELINE);
-        text(hdc, tx, y + SC(122), tw, SC(20), L"切换", g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
-        text(hdc, tx + SC(120), y + SC(122), tw - SC(120), SC(20), L"自动获取 IP 与 DNS", g_fCardM, C_TEXT, DT_LEFT | DT_SINGLELINE);
+        text(hdc, tx, y + SC(50), tw, SC(20), T("field_ip"), g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
+        text(hdc, tx + SC(120), y + SC(50), tw - SC(120), SC(20), T("field_auto"), g_fCardM, accent, DT_LEFT | DT_SINGLELINE);
+        text(hdc, tx, y + SC(74), tw, SC(20), T("field_dns"), g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
+        text(hdc, tx + SC(120), y + SC(74), tw - SC(120), SC(20), T("field_auto"), g_fCardM, accent, DT_LEFT | DT_SINGLELINE);
+        text(hdc, tx, y + SC(98), tw, SC(20), T("field_type"), g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
+        text(hdc, tx + SC(120), y + SC(98), tw - SC(120), SC(20), T("field_internet"), g_fCardM, accent, DT_LEFT | DT_SINGLELINE);
+        text(hdc, tx, y + SC(122), tw, SC(20), T("field_switch"), g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
+        text(hdc, tx + SC(120), y + SC(122), tw - SC(120), SC(20), T("field_switch_desc"), g_fCardM, C_TEXT, DT_LEFT | DT_SINGLELINE);
     }
     /* 底部提示 */
     text(hdc, tx, y + h - SC(30), tw, SC(20),
-         i == 0 ? L"点击卡片应用固定 IP 参数" : L"点击卡片切换为 DHCP 自动获取",
+         i == 0 ? T("card_lan_hint") : T("card_wan_hint"),
          g_fCardM, C_DIM, DT_LEFT | DT_SINGLELINE);
 }
 
@@ -899,8 +985,8 @@ static void draw(HDC hdc, HWND hwnd) {
     fill(hdc, 0, 0, W, H, C_BG);
 
     /* 头部 */
-    text(hdc, SC(40), SC(20), SC(420), SC(42), L"上网环境设置工具", g_fTitle, C_ACCENT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    text(hdc, SC(40), SC(64), SC(520), SC(22), L"NETWORK SWITCHER  ·  V5.2  ·  内网/互联网一键切换", g_fSub, C_DIM, DT_LEFT | DT_SINGLELINE);
+    text(hdc, SC(40), SC(20), SC(420), SC(42), T("app_title"), g_fTitle, C_ACCENT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    text(hdc, SC(40), SC(64), SC(520), SC(22), T("sub_title"), g_fSub, C_DIM, DT_LEFT | DT_SINGLELINE);
     hgradient(hdc, SC(40), SC(96), W - SC(80), SC(2), C_ACCENT, C_ACCENT2);
 
     /* 参数设置按钮（右上角） */
@@ -910,13 +996,13 @@ static void draw(HDC hdc, HWND hwnd) {
             SC(8), sbg, g_hover == 3 ? lighten(C_ACCENT2, 30) : C_GRID, 1);
     text(hdc, g_settingsRC.left, g_settingsRC.top,
          g_settingsRC.right - g_settingsRC.left, g_settingsRC.bottom - g_settingsRC.top,
-         L"参数设置", g_fChip, C_ACCENT2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+         T("btn_settings"), g_fChip, C_ACCENT2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     /* 状态芯片 */
     int x = SC(40);
-    draw_chip(hdc, &x, L"权限", g_admin ? L"管理员" : L"受限", g_admin ? C_GREEN : C_RED);
-    draw_chip(hdc, &x, L"网卡", g_Interface, C_ACCENT);
-    draw_chip(hdc, &x, L"本机IP", g_curIP, C_ACCENT);
+    draw_chip(hdc, &x, T("chip_perm"), g_admin ? T("chip_admin") : T("chip_limited"), g_admin ? C_GREEN : C_RED);
+    draw_chip(hdc, &x, T("chip_nic"), g_Interface, C_ACCENT);
+    draw_chip(hdc, &x, T("chip_ip"), g_curIP, C_ACCENT);
 
     /* 模式卡片 */
     draw_card(hdc, 0);
@@ -929,16 +1015,16 @@ static void draw(HDC hdc, HWND hwnd) {
             SC(10), rbg, g_hover == 2 ? lighten(C_ACCENT, 20) : C_GRID, 1);
     text(hdc, g_refreshRC.left, g_refreshRC.top,
          g_refreshRC.right - g_refreshRC.left, g_refreshRC.bottom - g_refreshRC.top,
-         L"查看当前网络配置", g_fCardM, C_ACCENT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+         T("btn_view"), g_fCardM, C_ACCENT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     /* 日志面板 */
     rounded(hdc, g_logPanel.left, g_logPanel.top,
             g_logPanel.right - g_logPanel.left, g_logPanel.bottom - g_logPanel.top,
             SC(12), C_PANEL, C_GRID, 1);
     text(hdc, g_logPanel.left + SC(18), g_logPanel.top + SC(10),
-         SC(300), SC(20), L"运行日志 / CONSOLE", g_fChip, C_DIM, DT_LEFT | DT_SINGLELINE);
+         SC(300), SC(20), T("log_title"), g_fChip, C_DIM, DT_LEFT | DT_SINGLELINE);
     text(hdc, g_logPanel.right - SC(150), g_logPanel.top + SC(10),
-         SC(130), SC(20), L"滚轮翻阅", g_fChip, g_cursor_on ? C_GREEN : C_DIM, DT_RIGHT | DT_SINGLELINE);
+         SC(130), SC(20), T("log_scroll"), g_fChip, g_cursor_on ? C_GREEN : C_DIM, DT_RIGHT | DT_SINGLELINE);
 
     RECT cr = { g_logPanel.left + SC(14), g_logPanel.top + SC(38),
                 g_logPanel.right - SC(14), g_logPanel.bottom - SC(12) };
@@ -946,7 +1032,7 @@ static void draw(HDC hdc, HWND hwnd) {
 
     /* 底部说明 */
     text(hdc, 0, H - SC(26), W, SC(20),
-         L"以管理员身份运行 · 参数设置自动保存，无需外部配置文件",
+         T("foot_note"),
          g_fFoot, C_DIM, DT_CENTER | DT_SINGLELINE);
 }
 
@@ -1044,11 +1130,11 @@ static void s_draw_btn(HDC hdc, RECT *r, const WCHAR *label, COLORREF fillc, COL
 
 static void s_save(HWND hwnd) {
     WCHAR v[64];
-    GetWindowTextW(g_sEdits[1], v, 64); trim_w(v); if (!valid_ip(v)) { wcscpy(g_sErr, L"IP 地址格式无效"); InvalidateRect(hwnd, NULL, FALSE); return; }
-    GetWindowTextW(g_sEdits[2], v, 64); trim_w(v); if (!valid_ip(v)) { wcscpy(g_sErr, L"子网掩码格式无效"); InvalidateRect(hwnd, NULL, FALSE); return; }
-    GetWindowTextW(g_sEdits[3], v, 64); trim_w(v); if (!valid_ip(v)) { wcscpy(g_sErr, L"默认网关格式无效"); InvalidateRect(hwnd, NULL, FALSE); return; }
-    GetWindowTextW(g_sEdits[4], v, 64); trim_w(v); if (!valid_ip(v)) { wcscpy(g_sErr, L"DNS 地址格式无效"); InvalidateRect(hwnd, NULL, FALSE); return; }
-    GetWindowTextW(g_sEdits[0], v, 64); trim_w(v); if (!v[0]) { wcscpy(g_sErr, L"网卡名称不能为空"); InvalidateRect(hwnd, NULL, FALSE); return; }
+    GetWindowTextW(g_sEdits[1], v, 64); trim_w(v); if (!valid_ip(v)) { wcscpy(g_sErr, T("err_ip")); InvalidateRect(hwnd, NULL, FALSE); return; }
+    GetWindowTextW(g_sEdits[2], v, 64); trim_w(v); if (!valid_ip(v)) { wcscpy(g_sErr, T("err_mask")); InvalidateRect(hwnd, NULL, FALSE); return; }
+    GetWindowTextW(g_sEdits[3], v, 64); trim_w(v); if (!valid_ip(v)) { wcscpy(g_sErr, T("err_gw")); InvalidateRect(hwnd, NULL, FALSE); return; }
+    GetWindowTextW(g_sEdits[4], v, 64); trim_w(v); if (!valid_ip(v)) { wcscpy(g_sErr, T("err_dns")); InvalidateRect(hwnd, NULL, FALSE); return; }
+    GetWindowTextW(g_sEdits[0], v, 64); trim_w(v); if (!v[0]) { wcscpy(g_sErr, T("err_ifc")); InvalidateRect(hwnd, NULL, FALSE); return; }
 
     GetWindowTextW(g_sEdits[0], g_Interface, 63); trim_w(g_Interface);
     GetWindowTextW(g_sEdits[1], g_StaticIP, 31); trim_w(g_StaticIP);
@@ -1099,7 +1185,7 @@ static DWORD WINAPI sync_thread(LPVOID p) {
 static void s_sync_cloud(void) {
     if (g_syncBusy) return;
     g_syncBusy = 1;
-    wcscpy(g_sErr, L"正在从云端同步 ...");
+    wcscpy(g_sErr, T("sync_loading"));
     InvalidateRect(g_settingsWin, NULL, FALSE);
     HWND btn = GetDlgItem(g_settingsWin, IDC_DEFAULT);
     if (btn) EnableWindow(btn, FALSE);
@@ -1124,7 +1210,7 @@ static LRESULT CALLBACK s_WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         int W = SC(440), fx = SC(128), fw = SC(272), fh = SC(30);
         int ys[5] = { SC(70), SC(110), SC(150), SC(190), SC(230) };
-        const WCHAR *lbl[5] = { L"网卡名称", L"内网 IP", L"子网掩码", L"默认网关", L"DNS 服务器" };
+        const WCHAR *lbl[5] = { T("lbl_interface"), T("lbl_ip"), T("lbl_mask"), T("lbl_gw"), T("lbl_dns") };
         for (int i = 0; i < 5; i++)
             CreateWindowW(L"STATIC", lbl[i], WS_CHILD | WS_VISIBLE,
                           SC(28), ys[i] + SC(6), SC(92), SC(20), hwnd,
@@ -1135,9 +1221,9 @@ static LRESULT CALLBACK s_WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         s_make_edit(hwnd, IDC_EDIT_GW,   fx, ys[3], fw, fh, g_Gateway);
         s_make_edit(hwnd, IDC_EDIT_DNS,  fx, ys[4], fw, fh, g_DnsServer);
 
-        s_make_btn(hwnd, IDC_DEFAULT, L"同步云端配置", SC(28), SC(288), SC(120), SC(34));
-        s_make_btn(hwnd, IDC_CANCEL,  L"取消",     W - SC(104) - SC(104) - SC(16), SC(288), SC(104), SC(34));
-        s_make_btn(hwnd, IDC_SAVE,    L"保存",     W - SC(104), SC(288), SC(104), SC(34));
+        s_make_btn(hwnd, IDC_DEFAULT, T("btn_sync"), SC(28), SC(288), SC(120), SC(34));
+        s_make_btn(hwnd, IDC_CANCEL,  T("btn_cancel"),     W - SC(104) - SC(104) - SC(16), SC(288), SC(104), SC(34));
+        s_make_btn(hwnd, IDC_SAVE,    T("btn_save"),     W - SC(104), SC(288), SC(104), SC(34));
         return 0;
     }
 
@@ -1161,7 +1247,7 @@ static LRESULT CALLBACK s_WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
         HGDIOBJ ob = SelectObject(mem, bmp);
         fill(mem, 0, 0, rc.right, rc.bottom, C_PANEL);
-        text(mem, SC(28), SC(20), SC(300), SC(34), L"网络参数设置", g_fTitle, C_ACCENT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        text(mem, SC(28), SC(20), SC(300), SC(34), T("settings_title"), g_fTitle, C_ACCENT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         hgradient(mem, SC(28), SC(58), rc.right - SC(56), SC(2), C_ACCENT, C_ACCENT2);
         /* 编辑框底框 */
         int fx = SC(128), fw = SC(272), fh = SC(30);
@@ -1182,11 +1268,11 @@ static LRESULT CALLBACK s_WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT r = di->rcItem;
         int pressed = (di->itemState & ODS_SELECTED) != 0;
         if (di->CtlID == IDC_SAVE)
-            s_draw_btn(di->hDC, &r, L"保存", C_ACCENT, RGB(4, 30, 40), pressed);
+            s_draw_btn(di->hDC, &r, T("btn_save"), C_ACCENT, RGB(4, 30, 40), pressed);
         else if (di->CtlID == IDC_CANCEL)
-            s_draw_btn(di->hDC, &r, L"取消", RGB(28, 38, 58), C_TEXT, pressed);
+            s_draw_btn(di->hDC, &r, T("btn_cancel"), RGB(28, 38, 58), C_TEXT, pressed);
         else if (di->CtlID == IDC_DEFAULT)
-            s_draw_btn(di->hDC, &r, L"同步云端配置", RGB(28, 38, 58), C_ACCENT2, pressed);
+            s_draw_btn(di->hDC, &r, T("btn_sync"), RGB(28, 38, 58), C_ACCENT2, pressed);
         return TRUE;
     }
 
@@ -1218,7 +1304,7 @@ static void open_settings(HWND parent) {
     int x = pr.left + (pr.right - pr.left - w) / 2;
     int y = pr.top + (pr.bottom - pr.top - h) / 2;
     EnableWindow(parent, FALSE);
-    HWND sw = CreateWindowW(L"IPSwitchSettingsWin", L"网络参数设置",
+    HWND sw = CreateWindowW(L"IPSwitchSettingsWin", T("settings_title"),
                             WS_POPUP | WS_CAPTION | WS_SYSMENU,
                             x, y, w, h, parent, NULL, g_hInst, NULL);
     if (!sw) { EnableWindow(parent, TRUE); g_settingsOpen = 0; return; }
@@ -1263,13 +1349,13 @@ static LRESULT CALLBACK n_WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         int W = SC(480), by = SC(282);
-        HWND b = CreateWindowW(L"BUTTON", g_ntType ? L"确定" : L"知道了",
+        HWND b = CreateWindowW(L"BUTTON", g_ntType ? T("btn_ok") : T("btn_gotit"),
                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                W - SC(104) - SC(16) - SC(96), by, SC(96), SC(32),
                                hwnd, (HMENU)(INT_PTR)IDN_OK, g_hInst, NULL);
         SendMessageW(b, WM_SETFONT, (WPARAM)g_fChip, TRUE);
         if (g_ntType == 1) {
-            b = CreateWindowW(L"BUTTON", L"稍后",
+            b = CreateWindowW(L"BUTTON", T("btn_later"),
                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                               W - SC(104) - SC(16) - SC(96) - SC(10) - SC(96), by,
                               SC(96), SC(32), hwnd, (HMENU)(INT_PTR)IDN_LATER, g_hInst, NULL);
@@ -1286,7 +1372,7 @@ static LRESULT CALLBACK n_WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HGDIOBJ ob = SelectObject(mem, bmp);
         fill(mem, 0, 0, rc.right, rc.bottom, C_PANEL);
         text(mem, SC(28), SC(18), rc.right - SC(56), SC(34),
-             g_ntType ? L"发现新版本" : L"公告",
+             g_ntType ? T("ntc_update_title") : T("ntc_ann_title"),
              g_fTitle, g_ntType ? C_ACCENT : C_ACCENT2,
              DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         hgradient(mem, SC(28), SC(56), rc.right - SC(56), SC(2), C_ACCENT, C_ACCENT2);
@@ -1323,7 +1409,7 @@ static LRESULT CALLBACK n_WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SelectObject(mem, oldF);
         if (g_ntType == 1)
             text(mem, SC(28), SC(246), rc.right - SC(56), SC(18),
-                 L"点击「确定」将自动下载最新版本，滚轮可下滑查看全文", g_fChip, C_DIM, DT_LEFT | DT_SINGLELINE);
+                 T("ntc_dl_hint"), g_fChip, C_DIM, DT_LEFT | DT_SINGLELINE);
         BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, ob); DeleteObject(bmp); DeleteDC(mem);
         EndPaint(hwnd, &ps);
@@ -1356,10 +1442,10 @@ static LRESULT CALLBACK n_WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT r = di->rcItem;
         int pressed = (di->itemState & ODS_SELECTED) != 0;
         if (di->CtlID == IDN_OK)
-            n_draw_btn(di->hDC, &r, g_ntType ? L"确定" : L"知道了",
+            n_draw_btn(di->hDC, &r, g_ntType ? T("btn_ok") : T("btn_gotit"),
                        C_ACCENT, RGB(4, 30, 40), pressed);
         else if (di->CtlID == IDN_LATER)
-            n_draw_btn(di->hDC, &r, L"稍后", RGB(28, 38, 58), C_TEXT, pressed);
+            n_draw_btn(di->hDC, &r, T("btn_later"), RGB(28, 38, 58), C_TEXT, pressed);
         return TRUE;
     }
 
@@ -1417,7 +1503,7 @@ static void open_notice(HWND parent, int type) {
     int x = pr.left + (pr.right - pr.left - ww) / 2;
     int y = pr.top + (pr.bottom - pr.top - wh) / 2;
     EnableWindow(parent, FALSE);
-    HWND sw = CreateWindowW(L"IPSwitchNoticeWin", type ? L"发现新版本" : L"公告",
+    HWND sw = CreateWindowW(L"IPSwitchNoticeWin", type ? T("ntc_update_title") : T("ntc_ann_title"),
                             WS_POPUP | WS_CAPTION | WS_SYSMENU,
                             x, y, ww, wh, parent, NULL, g_hInst, NULL);
     if (!sw) { EnableWindow(parent, TRUE); g_annShowing = 0; return; }
@@ -1430,6 +1516,16 @@ static void open_notice(HWND parent, int type) {
 static DWORD WINAPI online_check_thread(LPVOID p) {
     HWND hwnd = (HWND)p;
     logf(C_DIM, L"[在线] 开始检查公告与更新（多源容错）");
+
+    /* 云端界面文本 */
+    char *tx = fetch_json(REL_TEXTS, "\"app_title\"", 6000);
+    if (tx) {
+        apply_texts(tx);
+        logf(C_GREEN, L"[在线] 已加载云端界面文本");
+        free(tx);
+    } else {
+        logf(C_DIM, L"[在线] 云端界面文本获取失败，使用内置文本");
+    }
 
     /* 更新检查 */
     char *u = fetch_json(REL_UPDATE, "\"version\"", 8000);
@@ -1533,8 +1629,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else
                     logf(C_RED, L"[FAIL] MD5 校验不一致，请勿直接使用");
             }
-            MessageBoxW(hwnd, L"新版本已下载完成。\n请关闭本程序后，用新文件替换旧版本即可。",
-                        L"下载完成", MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(hwnd, T("msg_upd_done"),
+                        T("msg_upd_title"), MB_OK | MB_ICONINFORMATION);
         } else {
             logf(C_RED, L"[FAIL] 下载失败，已为你打开下载链接");
             ShellExecuteW(NULL, L"open", g_ntUrl, NULL, NULL, SW_SHOWNORMAL);
@@ -1556,7 +1652,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_sErr[0] = 0;
                 logf(C_GREEN, L"[OK] 已同步云端配置到编辑框，保存后生效");
             } else {
-                wcscpy(g_sErr, L"同步失败：无法连接云端或格式无效");
+                wcscpy(g_sErr, T("sync_fail"));
                 logf(C_RED, L"[FAIL] 云端配置同步失败（请检查网络）");
             }
             InvalidateRect(g_settingsWin, NULL, FALSE);
@@ -1686,8 +1782,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
     (void)hp; (void)cmd; (void)show;
     if (!is_admin()) {
-        MessageBoxW(NULL, L"需要管理员权限运行本工具。\n请右键选择“以管理员身份运行”。",
-                    L"上网环境设置工具", MB_OK | MB_ICONWARNING);
+        MessageBoxW(NULL, T("msg_admin_req"),
+                    T("app_title"), MB_OK | MB_ICONWARNING);
         return 1;
     }
     InitializeCriticalSection(&g_logCs);
@@ -1726,7 +1822,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
     int sx = GetSystemMetrics(SM_CXSCREEN), sy = GetSystemMetrics(SM_CYSCREEN);
     int wx = (sx - ww) / 2, wy = (sy - wh) / 2;
     if (wx < 0) wx = 0; if (wy < 0) wy = 0;
-    HWND hwnd = CreateWindowW(L"IPSwitchWin", L"上网环境设置工具 v5.2",
+    HWND hwnd = CreateWindowW(L"IPSwitchWin", L"上网环境设置工具 v5.3",
                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                               wx, wy, ww, wh,
                               NULL, NULL, hi, NULL);
