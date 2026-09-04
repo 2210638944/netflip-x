@@ -8,8 +8,7 @@
 
 ## 使用截图
 
-(https://aka.doubaocdn.com/s/OCOvGMe5H1)
-
+![主界面](https://raw.githubusercontent.com/2210638944/netflip-x/23d6e93b023f4f306a91e8b7a9c112e31b9d3290/preview.png)
 ## 怎么用
 
 1. 下载 `上网环境设置工具.exe`
