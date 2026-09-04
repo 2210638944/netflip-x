@@ -1,5 +1,5 @@
 /* ============================================================================
- *  上网环境设置工具 v4.2  —  Win32 GUI（暗色科幻风）
+ *  上网环境设置工具 v4.3  —  Win32 GUI（暗色科幻风）
  * ----------------------------------------------------------------------------
  *  功能：
  *    1. 内网固定 IP 模式    —— netsh 设置静态 IPv4 与 DNS
@@ -41,7 +41,7 @@ static WCHAR g_DnsServer[32]  = L"211.138.24.66";
 
 /* ------------------------------ 在线更新配置 ------------------------------ */
 /* 本工具版本号（与 update.json 的 version、Release tag 保持一致的基准） */
-static const char g_version[] = "4.2.0";
+static const char g_version[] = "4.3.0";
 /* GitHub 仓库（raw 直链，公网可访问，无需 token） */
 #define GH_BASE   L"https://raw.githubusercontent.com/2210638944/netflip-x/main/"
 #define URL_CONFIG GH_BASE L"config.json"
@@ -253,9 +253,34 @@ static int json_str(const char *s, const char *key, char *out, int n) {
     return 1;
 }
 
+/* 取 JSON 字段原始值：既支持带引号字符串，也支持裸 token（true/false/数字） */
+static int json_raw(const char *s, const char *key, char *out, int n) {
+    char pat[96];
+    _snprintf(pat, sizeof pat - 1, "\"%s\"", key);
+    const char *f = strstr(s, pat);
+    if (!f) return 0;
+    const char *v = f + strlen(pat);
+    while (*v == ' ' || *v == '\t') v++;
+    if (*v != ':') return 0;
+    v++;
+    while (*v == ' ' || *v == '\t') v++;
+    const char *e;
+    if (*v == '"') {
+        v++; e = v;
+        while (*e && *e != '"') e++;
+    } else {
+        e = v;
+        while (*e && *e != ',' && *e != '}' && *e != '\r' && *e != '\n' && *e != ' ' && *e != '\t') e++;
+    }
+    int len = (int)(e - v);
+    if (len >= n) len = n - 1;
+    memcpy(out, v, len); out[len] = 0;
+    return 1;
+}
+
 static int json_int(const char *s, const char *key, int def) {
     char buf[32];
-    if (json_str(s, key, buf, sizeof buf)) {
+    if (json_raw(s, key, buf, sizeof buf)) {
         char *end = NULL; long v = strtol(buf, &end, 10);
         if (end && *end == 0) return (int)v;
     }
@@ -264,7 +289,7 @@ static int json_int(const char *s, const char *key, int def) {
 
 static int json_bool(const char *s, const char *key) {
     char buf[8];
-    if (json_str(s, key, buf, sizeof buf)) return _stricmp(buf, "true") == 0;
+    if (json_raw(s, key, buf, sizeof buf)) return _stricmp(buf, "true") == 0;
     return 0;
 }
 
@@ -815,7 +840,7 @@ static void draw(HDC hdc, HWND hwnd) {
 
     /* 头部 */
     text(hdc, SC(40), SC(20), SC(420), SC(42), L"上网环境设置工具", g_fTitle, C_ACCENT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    text(hdc, SC(40), SC(64), SC(520), SC(22), L"NETWORK SWITCHER  ·  V4.2  ·  内网/互联网一键切换", g_fSub, C_DIM, DT_LEFT | DT_SINGLELINE);
+    text(hdc, SC(40), SC(64), SC(520), SC(22), L"NETWORK SWITCHER  ·  V4.3  ·  内网/互联网一键切换", g_fSub, C_DIM, DT_LEFT | DT_SINGLELINE);
     hgradient(hdc, SC(40), SC(96), W - SC(80), SC(2), C_ACCENT, C_ACCENT2);
 
     /* 参数设置按钮（右上角） */
@@ -1271,13 +1296,16 @@ static void open_notice(HWND parent, int type) {
     }
     g_annShowing = 1;
     int w = SC(480), h = SC(336);
+    RECT wr = { 0, 0, w, h };
+    AdjustWindowRectEx(&wr, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, 0);
+    int ww = wr.right - wr.left, wh = wr.bottom - wr.top;
     RECT pr; GetWindowRect(parent, &pr);
-    int x = pr.left + (pr.right - pr.left - w) / 2;
-    int y = pr.top + (pr.bottom - pr.top - h) / 2;
+    int x = pr.left + (pr.right - pr.left - ww) / 2;
+    int y = pr.top + (pr.bottom - pr.top - wh) / 2;
     EnableWindow(parent, FALSE);
     HWND sw = CreateWindowW(L"IPSwitchNoticeWin", type ? L"发现新版本" : L"公告",
                             WS_POPUP | WS_CAPTION | WS_SYSMENU,
-                            x, y, w, h, parent, NULL, g_hInst, NULL);
+                            x, y, ww, wh, parent, NULL, g_hInst, NULL);
     if (!sw) { EnableWindow(parent, TRUE); g_annShowing = 0; return; }
     ShowWindow(sw, SW_SHOW);
     UpdateWindow(sw);
@@ -1549,7 +1577,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
     int sx = GetSystemMetrics(SM_CXSCREEN), sy = GetSystemMetrics(SM_CYSCREEN);
     int wx = (sx - ww) / 2, wy = (sy - wh) / 2;
     if (wx < 0) wx = 0; if (wy < 0) wy = 0;
-    HWND hwnd = CreateWindowW(L"IPSwitchWin", L"上网环境设置工具 v4.2",
+    HWND hwnd = CreateWindowW(L"IPSwitchWin", L"上网环境设置工具 v4.3",
                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                               wx, wy, ww, wh,
                               NULL, NULL, hi, NULL);
