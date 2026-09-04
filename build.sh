@@ -21,9 +21,9 @@ echo "== 编译主程序 =="
 "$CC" -O2 -Wall -Wextra \
   "$BUILD/main.c" "$BUILD/app_res.o" \
   -mwindows \
-  -o "$BUILD/上网环境设置工具 v4.3.exe" \
+  -o "$BUILD/上网环境设置工具 v5.1.exe" \
   -lgdi32 -ladvapi32 -liphlpapi -lwininet -lurlmon -lshell32
 echo "== 复制成品 =="
-cp "$BUILD/上网环境设置工具 v4.3.exe" "./上网环境设置工具 v4.3.exe"
-ls -la "./上网环境设置工具 v4.3.exe"
-xxd "./上网环境设置工具 v4.3.exe" | head -1
+cp "$BUILD/上网环境设置工具 v5.1.exe" "./上网环境设置工具 v5.1.exe"
+ls -la "./上网环境设置工具 v5.1.exe"
+xxd "./上网环境设置工具 v5.1.exe" | head -1

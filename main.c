@@ -1,5 +1,5 @@
 /* ============================================================================
- *  上网环境设置工具 v4.3  —  Win32 GUI（暗色科幻风）
+ *  上网环境设置工具 v5.1  —  Win32 GUI（暗色科幻风）
  * ----------------------------------------------------------------------------
  *  功能：
  *    1. 内网固定 IP 模式    —— netsh 设置静态 IPv4 与 DNS
@@ -41,12 +41,11 @@ static WCHAR g_DnsServer[32]  = L"211.138.24.66";
 
 /* ------------------------------ 在线更新配置 ------------------------------ */
 /* 本工具版本号（与 update.json 的 version、Release tag 保持一致的基准） */
-static const char g_version[] = "4.3.0";
-/* GitHub 仓库（raw 直链，公网可访问，无需 token） */
-#define GH_BASE   L"https://raw.githubusercontent.com/2210638944/netflip-x/main/"
-#define URL_CONFIG GH_BASE L"config.json"
-#define URL_UPDATE GH_BASE L"update.json"
-#define URL_NOTICE GH_BASE L"notice.json"
+static const char g_version[] = "5.1.0";
+/* GitHub 仓库 JSON（多源容错：jsDelivr 多节点 + 国内镜像，程序内 fetch_json 按序尝试） */
+#define REL_CONFIG L"config.json"
+#define REL_UPDATE L"update.json"
+#define REL_NOTICE L"notice.json"
 
 /* 公告状态（后台线程拉取后经 PostMessage 通知主线程） */
 static volatile int g_pendingUpdate = 0;
@@ -57,6 +56,12 @@ static int  g_lastNoticeId = 0;       /* 本地已看过的纯公告 id（注册
 #define WM_APP_UPDATE  (WM_APP + 1)   /* 有更新公告 */
 #define WM_APP_NOTICE  (WM_APP + 2)   /* 有纯公告 */
 #define WM_APP_DL_DONE (WM_APP + 3)   /* 下载完成 */
+#define WM_APP_SYNC_DONE (WM_APP + 4) /* 云端配置同步完成 */
+
+/* 云端配置同步（后台线程结果，经 WM_APP_SYNC_DONE 通知主线程） */
+static WCHAR g_syncIfc[64], g_syncIP[32], g_syncMask[32], g_syncGW[32], g_syncDNS[32];
+static int   g_syncOk = 0;            /* 1=同步成功 */
+static int   g_syncBusy = 0;          /* 1=正在同步 */
 
 /* 后台线程填充 → 主线程经消息队列读取 */
 static WCHAR g_updTitle[128], g_updContent[1024], g_updUrl[512], g_updMd5[64], g_updFile[64];
@@ -120,8 +125,10 @@ static int  g_settingsOpen = 0;
 typedef struct { WCHAR txt[LOG_LEN]; COLORREF col; } LOGT;
 static LOGT g_log[LOG_CAP];
 static int  g_log_n = 0;
+static CRITICAL_SECTION g_logCs;
 
 static void log_line(const WCHAR *s, COLORREF c) {
+    EnterCriticalSection(&g_logCs);
     WCHAR full[LOG_LEN];
     SYSTEMTIME st; GetLocalTime(&st);
     _snwprintf(full, LOG_LEN - 1, L"[%02d:%02d:%02d] %s",
@@ -142,6 +149,7 @@ static void log_line(const WCHAR *s, COLORREF c) {
         g_log[LOG_CAP - 1].col = c;
     }
     g_scroll = 0;  /* 新日志自动回到最新 */
+    LeaveCriticalSection(&g_logCs);
 }
 
 static void logf(COLORREF c, const WCHAR *fmt, ...) {
@@ -227,9 +235,50 @@ static char *fetch_url(const WCHAR *url, int timeout_ms) {
     free(acc);
     return NULL;
 }
-/* 在 URL 后追加时间戳参数，规避本地/CDN 缓存，保证拉到最新内容 */
-static void url_now(const WCHAR *base, WCHAR *out, int n) {
-    _snwprintf(out, n, L"%s?t=%lu", base, (unsigned long)GetTickCount());
+/* 多源容错 + 内容校验：按序尝试 jsDelivr 各节点（含国内镜像），
+   拉到内容后检查是否含关键字段 need（如 "\"notice_id\""），不含则换下一个源。
+   带总预算 budget_ms：到点立即停止，避免没网时无限等待。全部失败返回 NULL。
+   注意：仅在后台线程调用，不会阻塞界面。 */
+static char *fetch_json(const WCHAR *rel, const char *need, int budget_ms) {
+    static const WCHAR *bases[] = {
+        L"https://cdn.jsdelivr.net/gh/2210638944/netflip-x@main/",
+        L"https://fastly.jsdelivr.net/gh/2210638944/netflip-x@main/",
+        L"https://testingcf.jsdelivr.net/gh/2210638944/netflip-x@main/",
+        L"https://gcore.jsdelivr.net/gh/2210638944/netflip-x@main/",
+        L"https://cdn.jsdmirror.com/gh/2210638944/netflip-x@main/",
+    };
+    static const char *hosts[] = {
+        "cdn.jsdelivr.net", "fastly.jsdelivr.net", "testingcf.jsdelivr.net",
+        "gcore.jsdelivr.net", "cdn.jsdmirror.com",
+    };
+    const int n = (int)(sizeof bases / sizeof bases[0]);
+    WCHAR url[900];
+    DWORD t0 = GetTickCount();
+    for (int i = 0; i < n; i++) {
+        DWORD elapsed = GetTickCount() - t0;
+        if (elapsed >= (DWORD)budget_ms) {
+            logf(C_RED, L"[在线] 已达到 %dms 总时限，停止尝试更多源", budget_ms);
+            break;
+        }
+        int remain = budget_ms - (int)elapsed;
+        if (remain < 600) remain = 600;   /* 给最后一步留最小机会 */
+        logf(C_DIM, L"[在线]   尝试源[%d/%d] %hs ...", i + 1, n, hosts[i]);
+        _snwprintf(url, 900, L"%s%s?t=%lu", bases[i], rel, (unsigned long)GetTickCount());
+        char *r = fetch_url(url, remain);
+        if (!r) {
+            logf(C_RED, L"[在线]      %hs 连接失败，换下一个源", hosts[i]);
+            continue;
+        }
+        if (need && !strstr(r, need)) {
+            logf(C_RED, L"[在线]      %hs 内容不符（非预期 JSON），换下一个源", hosts[i]);
+            free(r);
+            continue;
+        }
+        logf(C_GREEN, L"[在线]      %hs 拉取成功", hosts[i]);
+        return r;
+    }
+    logf(C_RED, L"[在线] 全部 %d 个源均不可用（%ls）", n, rel);
+    return NULL;
 }
 
 /* 极简扁平 JSON：取 "key":"value" 的字符串值（UTF-8），返回 1 成功 0 失败 */
@@ -492,6 +541,8 @@ static DWORD run_cmd(const WCHAR *cmdline) {
 
 /* ------------------------------ 核心功能 ---------------------------------- */
 static void refresh_config(void);
+static DWORD WINAPI online_check_thread(LPVOID p);
+static int detect_current_mode(void);
 
 static void apply_static(void) {
     g_busy = 1;
@@ -529,6 +580,12 @@ static void apply_dhcp(void) {
     g_card[1].active = 1; g_card[0].active = 0;
     refresh_config();
     g_busy = 0;
+    /* 切到互联网模式后自动重新检查公告与更新（无需重启程序） */
+    if (detect_current_mode() == 1) {
+        log_line(L"已切换至互联网模式，重新检查公告与更新 ...", C_DIM);
+        HANDLE th = CreateThread(NULL, 0, online_check_thread, g_mainWnd, 0, NULL);
+        if (th) CloseHandle(th);
+    }
 }
 
 static void refresh_config(void) {
@@ -783,6 +840,7 @@ static void draw_card(HDC hdc, int i) {
 
 static void draw_console(HDC hdc, RECT cr) {
     fill(hdc, cr.left, cr.top, cr.right - cr.left, cr.bottom - cr.top, C_CONSOLE);
+    EnterCriticalSection(&g_logCs);
 
     int lineH = SC(19);
     int availH = (cr.bottom - cr.top) - SC(6);
@@ -807,6 +865,7 @@ static void draw_console(HDC hdc, RECT cr) {
         yy += lineH;
     }
 
+    LeaveCriticalSection(&g_logCs);
     /* 光标（仅最新一行时闪烁） */
     if (g_scroll == 0 && total > 0 && g_cursor_on) {
         fill(hdc, cr.left + SC(8), yy + SC(2), SC(8), lineH - SC(4), C_ACCENT);
@@ -840,7 +899,7 @@ static void draw(HDC hdc, HWND hwnd) {
 
     /* 头部 */
     text(hdc, SC(40), SC(20), SC(420), SC(42), L"上网环境设置工具", g_fTitle, C_ACCENT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    text(hdc, SC(40), SC(64), SC(520), SC(22), L"NETWORK SWITCHER  ·  V4.3  ·  内网/互联网一键切换", g_fSub, C_DIM, DT_LEFT | DT_SINGLELINE);
+    text(hdc, SC(40), SC(64), SC(520), SC(22), L"NETWORK SWITCHER  ·  V5.1  ·  内网/互联网一键切换", g_fSub, C_DIM, DT_LEFT | DT_SINGLELINE);
     hgradient(hdc, SC(40), SC(96), W - SC(80), SC(2), C_ACCENT, C_ACCENT2);
 
     /* 参数设置按钮（右上角） */
@@ -1001,45 +1060,51 @@ static void s_save(HWND hwnd) {
     s_close(hwnd);
 }
 
+/* 后台线程：拉取云端 config.json（多源容错），结果写入 g_sync* 后通知主线程 */
+static DWORD WINAPI sync_thread(LPVOID p) {
+    (void)p;
+    g_syncOk = 0;
+    char *raw = fetch_json(REL_CONFIG, "\"interface\"", 10000);
+    if (raw) {
+        char s_ifc[128] = "", s_ip[32] = "", s_mask[32] = "", s_gw[32] = "", s_dns[32] = "";
+        int ok = json_str(raw, "interface", s_ifc, sizeof s_ifc)
+              && json_str(raw, "ip", s_ip, sizeof s_ip)
+              && json_str(raw, "mask", s_mask, sizeof s_mask)
+              && json_str(raw, "gateway", s_gw, sizeof s_gw)
+              && json_str(raw, "dns", s_dns, sizeof s_dns);
+        WCHAR w_ifc[64], w_ip[32], w_mask[32], w_gw[32], w_dns[32];
+        if (ok) {
+            MultiByteToWideChar(CP_UTF8, 0, s_ifc, -1, w_ifc, 64);
+            MultiByteToWideChar(CP_UTF8, 0, s_ip, -1, w_ip, 32);
+            MultiByteToWideChar(CP_UTF8, 0, s_mask, -1, w_mask, 32);
+            MultiByteToWideChar(CP_UTF8, 0, s_gw, -1, w_gw, 32);
+            MultiByteToWideChar(CP_UTF8, 0, s_dns, -1, w_dns, 32);
+            if (!w_ifc[0] || !valid_ip(w_ip) || !valid_ip(w_mask) || !valid_ip(w_gw) || !valid_ip(w_dns))
+                ok = 0;
+        }
+        if (ok) {
+            wcscpy(g_syncIfc, w_ifc);  wcscpy(g_syncIP, w_ip);
+            wcscpy(g_syncMask, w_mask); wcscpy(g_syncGW, w_gw);
+            wcscpy(g_syncDNS, w_dns);
+            g_syncOk = 1;
+        }
+        free(raw);
+    }
+    PostMessageW(g_mainWnd, WM_APP_SYNC_DONE, 0, 0);
+    return 0;
+}
+
+/* 设置窗「同步云端配置」：后台拉取，不阻塞界面 */
 static void s_sync_cloud(void) {
-    WCHAR url_cfg[640];
-    url_now(URL_CONFIG, url_cfg, 640);
-    char *raw = fetch_url(url_cfg, 10000);
-    if (!raw) {
-        wcscpy(g_sErr, L"无法连接 GitHub，同步失败");
-        InvalidateRect(g_settingsWin, NULL, FALSE);
-        return;
-    }
-    char s_ifc[128] = "", s_ip[32] = "", s_mask[32] = "", s_gw[32] = "", s_dns[32] = "";
-    int ok = json_str(raw, "interface", s_ifc, sizeof s_ifc)
-          && json_str(raw, "ip", s_ip, sizeof s_ip)
-          && json_str(raw, "mask", s_mask, sizeof s_mask)
-          && json_str(raw, "gateway", s_gw, sizeof s_gw)
-          && json_str(raw, "dns", s_dns, sizeof s_dns);
-    WCHAR w_ifc[64], w_ip[32], w_mask[32], w_gw[32], w_dns[32];
-    if (ok) {
-        MultiByteToWideChar(CP_UTF8, 0, s_ifc, -1, w_ifc, 64);
-        MultiByteToWideChar(CP_UTF8, 0, s_ip, -1, w_ip, 32);
-        MultiByteToWideChar(CP_UTF8, 0, s_mask, -1, w_mask, 32);
-        MultiByteToWideChar(CP_UTF8, 0, s_gw, -1, w_gw, 32);
-        MultiByteToWideChar(CP_UTF8, 0, s_dns, -1, w_dns, 32);
-        if (!w_ifc[0] || !valid_ip(w_ip) || !valid_ip(w_mask) || !valid_ip(w_gw) || !valid_ip(w_dns))
-            ok = 0;
-    }
-    free(raw);
-    if (!ok) {
-        wcscpy(g_sErr, L"云端配置格式无效，未填充");
-        InvalidateRect(g_settingsWin, NULL, FALSE);
-        return;
-    }
-    SetWindowTextW(g_sEdits[0], w_ifc);
-    SetWindowTextW(g_sEdits[1], w_ip);
-    SetWindowTextW(g_sEdits[2], w_mask);
-    SetWindowTextW(g_sEdits[3], w_gw);
-    SetWindowTextW(g_sEdits[4], w_dns);
-    g_sErr[0] = 0;
-    logf(C_GREEN, L"[OK] 已同步云端配置到编辑框，保存后生效");
+    if (g_syncBusy) return;
+    g_syncBusy = 1;
+    wcscpy(g_sErr, L"正在从云端同步 ...");
     InvalidateRect(g_settingsWin, NULL, FALSE);
+    HWND btn = GetDlgItem(g_settingsWin, IDC_DEFAULT);
+    if (btn) EnableWindow(btn, FALSE);
+    logf(C_ACCENT, L"正在从云端同步默认配置 ...");
+    HANDLE th = CreateThread(NULL, 0, sync_thread, NULL, 0, NULL);
+    if (th) CloseHandle(th);
 }
 
 static void s_close(HWND hwnd) {
@@ -1315,13 +1380,14 @@ static void open_notice(HWND parent, int type) {
 /* ------------------------------ 在线检查（后台线程） ------------------------ */
 static DWORD WINAPI online_check_thread(LPVOID p) {
     HWND hwnd = (HWND)p;
+    logf(C_DIM, L"[在线] 开始检查公告与更新（多源容错）");
 
-    WCHAR url_upd[640];
-    url_now(URL_UPDATE, url_upd, 640);
-    char *u = fetch_url(url_upd, 8000);
+    /* 更新检查 */
+    char *u = fetch_json(REL_UPDATE, "\"version\"", 8000);
     if (u) {
         char ver[32] = "", title[192] = "", content[1024] = "", url[512] = "", md5[64] = "", file[64] = "";
         if (json_str(u, "version", ver, sizeof ver) && cmp_version(ver, g_version) > 0) {
+            logf(C_ACCENT, L"[在线] 发现新版本 %hs（本地 %hs）", ver, g_version);
             json_str(u, "title", title, sizeof title);
             json_str(u, "content", content, sizeof content);
             json_str(u, "url", url, sizeof url);
@@ -1335,16 +1401,20 @@ static DWORD WINAPI online_check_thread(LPVOID p) {
             MultiByteToWideChar(CP_UTF8, 0, file, -1, g_updFile, 64);
             g_pendingUpdate = 1;
             PostMessageW(hwnd, WM_APP_UPDATE, 0, 0);
+        } else {
+            logf(C_DIM, L"[在线] 更新检查：已是最新（云端 %hs）", ver);
         }
         free(u);
+    } else {
+        logf(C_RED, L"[在线] 更新检查：所有源均无法连接（请检查网络/VPN）");
     }
 
-    WCHAR url_ntc[640];
-    url_now(URL_NOTICE, url_ntc, 640);
-    char *n = fetch_url(url_ntc, 8000);
+    /* 公告检查 */
+    char *n = fetch_json(REL_NOTICE, "\"notice_id\"", 8000);
     if (n) {
         int nid = json_int(n, "notice_id", 0);
         if (json_bool(n, "show") && nid != g_lastNoticeId) {
+            logf(C_ACCENT, L"[在线] 收到新公告 id=%d", nid);
             char title[192] = "", content[1024] = "";
             json_str(n, "title", title, sizeof title);
             json_str(n, "content", content, sizeof content);
@@ -1354,8 +1424,12 @@ static DWORD WINAPI online_check_thread(LPVOID p) {
             g_ntcId = nid;
             g_pendingNotice = 1;
             PostMessageW(hwnd, WM_APP_NOTICE, 0, 0);
+        } else {
+            logf(C_DIM, L"[在线] 公告 id=%d（已看过或未开启，不弹）", nid);
         }
         free(n);
+    } else {
+        logf(C_RED, L"[在线] 公告获取失败：所有源均无法连接");
     }
     return 0;
 }
@@ -1413,6 +1487,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else {
             logf(C_RED, L"[FAIL] 下载失败，已为你打开下载链接");
             ShellExecuteW(NULL, L"open", g_ntUrl, NULL, NULL, SW_SHOWNORMAL);
+        }
+        return 0;
+    }
+
+    case WM_APP_SYNC_DONE: {
+        g_syncBusy = 0;
+        if (g_settingsOpen && g_settingsWin) {
+            HWND btn = GetDlgItem(g_settingsWin, IDC_DEFAULT);
+            if (btn) EnableWindow(btn, TRUE);
+            if (g_syncOk) {
+                SetWindowTextW(g_sEdits[0], g_syncIfc);
+                SetWindowTextW(g_sEdits[1], g_syncIP);
+                SetWindowTextW(g_sEdits[2], g_syncMask);
+                SetWindowTextW(g_sEdits[3], g_syncGW);
+                SetWindowTextW(g_sEdits[4], g_syncDNS);
+                g_sErr[0] = 0;
+                logf(C_GREEN, L"[OK] 已同步云端配置到编辑框，保存后生效");
+            } else {
+                wcscpy(g_sErr, L"同步失败：无法连接云端或格式无效");
+                logf(C_RED, L"[FAIL] 云端配置同步失败（请检查网络）");
+            }
+            InvalidateRect(g_settingsWin, NULL, FALSE);
         }
         return 0;
     }
@@ -1529,6 +1625,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         KillTimer(hwnd, 1);
         destroy_fonts();
+        DeleteCriticalSection(&g_logCs);
         PostQuitMessage(0);
         return 0;
     }
@@ -1542,6 +1639,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
                     L"上网环境设置工具", MB_OK | MB_ICONWARNING);
         return 1;
     }
+    InitializeCriticalSection(&g_logCs);
     g_hInst = hi;
     g_scale = dpi_scale_of();
     load_config_reg();
@@ -1577,7 +1675,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show) {
     int sx = GetSystemMetrics(SM_CXSCREEN), sy = GetSystemMetrics(SM_CYSCREEN);
     int wx = (sx - ww) / 2, wy = (sy - wh) / 2;
     if (wx < 0) wx = 0; if (wy < 0) wy = 0;
-    HWND hwnd = CreateWindowW(L"IPSwitchWin", L"上网环境设置工具 v4.3",
+    HWND hwnd = CreateWindowW(L"IPSwitchWin", L"上网环境设置工具 v5.1",
                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                               wx, wy, ww, wh,
                               NULL, NULL, hi, NULL);
