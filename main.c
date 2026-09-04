@@ -321,11 +321,11 @@ static char *fetch_url(const WCHAR *url, int timeout_ms) {
     free(acc);
     return NULL;
 }
-/* 多源容错 + 内容校验：按序尝试 jsDelivr 各节点（含国内镜像），
-   拉到内容后检查是否含关键字段 need（如 "\"notice_id\""），不含则换下一个源。
-   带总预算 budget_ms：到点立即停止，避免没网时无限等待。全部失败返回 NULL。
+/* 多源容错 + 内容校验：按序尝试直链 + jsDelivr 各节点（含国内镜像），
+   每个源独立短超时（timeout_ms），全部试完；拉到内容后检查是否含关键字段
+   need（如 "\"notice_id\""），不含则换下一个源。全部失败返回 NULL。
    注意：仅在后台线程调用，不会阻塞界面。 */
-static char *fetch_json(const WCHAR *rel, const char *need, int budget_ms) {
+static char *fetch_json(const WCHAR *rel, const char *need, int timeout_ms) {
     static const WCHAR *bases[] = {
         L"https://github.com/2210638944/netflip-x/raw/refs/heads/main/",
         L"https://cdn.jsdelivr.net/gh/2210638944/netflip-x@main/",
@@ -340,18 +340,12 @@ static char *fetch_json(const WCHAR *rel, const char *need, int budget_ms) {
     };
     const int n = (int)(sizeof bases / sizeof bases[0]);
     WCHAR url[900];
-    DWORD t0 = GetTickCount();
     for (int i = 0; i < n; i++) {
-        DWORD elapsed = GetTickCount() - t0;
-        if (elapsed >= (DWORD)budget_ms) {
-            logf(C_RED, L"[在线] 已达到 %dms 总时限，停止尝试更多源", budget_ms);
-            break;
-        }
-        int remain = budget_ms - (int)elapsed;
-        if (remain < 600) remain = 600;   /* 给最后一步留最小机会 */
+        int cap = timeout_ms;
+        if (i == 0 && cap > 2500) cap = 2500;   /* 直链限时 2.5s：通了秒回，不通立刻让位 */
         logf(C_DIM, L"[在线]   尝试源[%d/%d] %hs ...", i + 1, n, hosts[i]);
         _snwprintf(url, 900, L"%s%s?t=%lu", bases[i], rel, (unsigned long)GetTickCount());
-        char *r = fetch_url(url, remain);
+        char *r = fetch_url(url, cap);
         if (!r) {
             logf(C_RED, L"[在线]      %hs 连接失败，换下一个源", hosts[i]);
             continue;
@@ -1151,7 +1145,7 @@ static void s_save(HWND hwnd) {
 static DWORD WINAPI sync_thread(LPVOID p) {
     (void)p;
     g_syncOk = 0;
-    char *raw = fetch_json(REL_CONFIG, "\"interface\"", 10000);
+    char *raw = fetch_json(REL_CONFIG, "\"interface\"", 3000);
     if (raw) {
         char s_ifc[128] = "", s_ip[32] = "", s_mask[32] = "", s_gw[32] = "", s_dns[32] = "";
         int ok = json_str(raw, "interface", s_ifc, sizeof s_ifc)
@@ -1518,7 +1512,7 @@ static DWORD WINAPI online_check_thread(LPVOID p) {
     logf(C_DIM, L"[在线] 开始检查公告与更新（多源容错）");
 
     /* 云端界面文本 */
-    char *tx = fetch_json(REL_TEXTS, "\"app_title\"", 6000);
+    char *tx = fetch_json(REL_TEXTS, "\"app_title\"", 3000);
     if (tx) {
         apply_texts(tx);
         logf(C_GREEN, L"[在线] 已加载云端界面文本");
@@ -1528,7 +1522,7 @@ static DWORD WINAPI online_check_thread(LPVOID p) {
     }
 
     /* 更新检查 */
-    char *u = fetch_json(REL_UPDATE, "\"version\"", 8000);
+    char *u = fetch_json(REL_UPDATE, "\"version\"", 3000);
     if (u) {
         char ver[32] = "", title[192] = "", content[1024] = "", url[512] = "", md5[64] = "", file[64] = "";
         if (json_str(u, "version", ver, sizeof ver) && cmp_version(ver, g_version) > 0) {
@@ -1555,7 +1549,7 @@ static DWORD WINAPI online_check_thread(LPVOID p) {
     }
 
     /* 公告检查 */
-    char *n = fetch_json(REL_NOTICE, "\"notice_id\"", 8000);
+    char *n = fetch_json(REL_NOTICE, "\"notice_id\"", 3000);
     if (n) {
         int nid = json_int(n, "notice_id", 0);
         if (json_bool(n, "show") && nid != g_lastNoticeId) {
