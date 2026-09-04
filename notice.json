@@ -1,5 +1,5 @@
 {
-  "notice_id": "8",
+  "notice_id": "9",
   "show": "true",
   "title": "欢迎使用 netflip-x",
   "content": "netflip-x 已上线。\n使用中遇到问题，欢迎在仓库 Issues 反馈。\n修复普通公告不显示的BUG[狗头]。\n修复公告弹窗按钮显示异常"
